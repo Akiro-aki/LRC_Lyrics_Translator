@@ -52,12 +52,12 @@ def test_cli_output_name_for_translated(mp3_path):
         "en",
         env={"TRANSLATOR_BACKEND": "google"},
     )
-    if proc.returncode != 0 and "network" in proc.stderr.lower():
-        pass  # offline environment: skip network-dependent assertions
-    else:
-        assert proc.returncode == 0, proc.stderr
+    if proc.returncode == 0:
         out = mp3_path.with_name("track.lrc")
         assert out.exists()
+    else:
+        assert "translate" in proc.stderr.lower()  # backend failure: clean error, no garbage .lrc
+        assert not mp3_path.with_name("track.lrc").exists()
 
 
 def test_cli_no_lyrics_errors(tmp_path):

@@ -164,7 +164,7 @@ def _build_output_lines(
         if rom is not None and rom[i] != line.text:
             out.append(LyricLine(line.time, rom[i]))
             romanized = True
-        if translated is not None and i not in skip:
+        if translated is not None and i not in skip and translated[i] != line.text:
             out.append(LyricLine(line.time, translated[i]))
     return out, detected, note, romanized
 
@@ -213,13 +213,17 @@ def _process_file(audio: str, args: argparse.Namespace, cache_dir: str | None) -
 
     lines = resolved.lines
     if args.translate or args.romanize:
-        lines, detected, note, romanized = _build_output_lines(
-            resolved.lines,
-            translate=args.translate,
-            romanize=args.romanize,
-            source_lang=args.source_lang,
-            target_lang=args.target_lang,
-        )
+        try:
+            lines, detected, note, romanized = _build_output_lines(
+                resolved.lines,
+                translate=args.translate,
+                romanize=args.romanize,
+                source_lang=args.source_lang,
+                target_lang=args.target_lang,
+            )
+        except TranslationError as exc:
+            sys.stderr.write(f"error: {audio}: {exc}\n")
+            return False
         if args.translate:
             translated_from = detected or args.source_lang or "unknown"
             target_lang = _normalize_lang(args.target_lang)

@@ -221,7 +221,9 @@ CACHE_DIR=~/.cache/audio2lrc    # override the lyrics cache location
 3. **Translates** (only with `--translate`): batches all lines in one call;
    if the response line count mismatches, retries per-line. Section markers
    (`[Chorus]`, `[Instrumental]`, ...) and empty lines pass through unchanged.
-   Timestamps are never shifted.
+   Lines the backend leaves identical are not duplicated in the output. If no
+   line can be translated at all, the run fails with an error and nothing is
+   written. Timestamps are never shifted.
 4. **Writes the `.lrc`:**
 
    Without translation:
@@ -244,7 +246,7 @@ CACHE_DIR=~/.cache/audio2lrc    # override the lyrics cache location
 |---|---|
 | `error: no lyrics found` | The file is untagged or has no embedded lyrics and LRCLIB has no match. `--prefer-embedded` can help for files with embedded lyrics. |
 | `low confidence: guessed artist/title from filename` | File has no ID3/Vorbis tags; rename it `Artist - Title.ext` for the best guess. |
-| Translation fails / no output | Check the backend config in `.env` (see above). `TRANSLATOR_BACKEND=google` works without any key. |
+| Translation fails / no output | Check the backend config in `.env` (see above). `TRANSLATOR_BACKEND=google` works without any key. If you get `429 Too Many Requests`, Google's free endpoint is rate-limiting you — wait a while or switch backends. When nothing can be translated, the app reports an error and writes **no** `.lrc` (it never writes duplicate lines). |
 | `--target-lang` errors | `--translate` requires `--target-lang`, e.g. `--target-lang en`. |
 | `--out` rejected | `--out` only works for single files, not in batch (directory) mode. |
 | Works on files, not on my NAS/SMB share | Mount the share first (e.g. `sudo mount -t cifs //server/share /mnt/music -o username=USER,uid=$(id -u),gid=$(id -g)`) and point audio2lrc at the mount path. The app needs write access to write `.lrc` files next to the audio. |

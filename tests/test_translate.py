@@ -12,13 +12,16 @@ LINES = ["first line", "[Chorus]", "", "second line"]
 
 
 class FakeTranslator:
-    def __init__(self, batch_result, detected="ja"):
+    def __init__(self, batch_result, detected="ja", single_result=None):
         self.batch_result = batch_result
         self.detected = detected
+        self.single_result = single_result
         self.calls = []
 
     def translate(self, lines, source_lang, target_lang):
         self.calls.append(list(lines))
+        if len(lines) == 1 and self.single_result is not None:
+            return list(self.single_result), self.detected
         if self.batch_result is None:
             raise TranslationError("boom")
         return list(self.batch_result), self.detected
@@ -40,16 +43,33 @@ def test_skipped_lines_pass_through_unchanged():
 
 
 def test_count_mismatch_triggers_per_line_fallback():
-    t = FakeTranslator(["too", "few"])  # 2 results for 4 lines
-    result, _ = translate_batched(t, LINES, None, "es")
-    assert result == ["first line", "[Chorus]", "", "second line"]
+    t = FakeTranslator(["too"], single_result=["uno"])  # batch: 1 result for 2 lines
+    result, _ = translate_batched(t, LINES, None, "es", skip_indices={1, 2})
+    assert result == ["uno", "[Chorus]", "", "uno"]
     assert len(t.calls) > 1
 
 
-def test_backend_failure_keeps_original_lines():
+def test_backend_total_failure_raises():
     t = FakeTranslator(None)
-    result, _ = translate_batched(t, LINES, None, "es")
-    assert result == LINES
+    with pytest.raises(TranslationError):
+        translate_batched(t, LINES, None, "es")
+
+
+def test_partial_failure_keeps_originals_for_failed_lines():
+    class PartialFake:
+        calls = 0
+
+        def translate(self, lines, source_lang, target_lang):
+            PartialFake.calls += 1
+            if PartialFake.calls == 1:
+                raise TranslationError("boom")
+            if PartialFake.calls == 2:
+                return ["uno"], "ja"
+            raise TranslationError("boom")
+
+    result, detected = translate_batched(PartialFake(), LINES, None, "es")
+    assert result == ["uno", "[Chorus]", "", "second line"]
+    assert detected == "ja"
 
 
 def test_all_lines_skipped_no_call():
@@ -124,6 +144,24 @@ def test_openai_requires_key(monkeypatch):
 
     with pytest.raises(TranslationError):
         OpenAITranslator(api_key="")
+
+
+def test_build_output_lines_skips_identical_translations(monkeypatch):
+    from audio2lrc.cli import _build_output_lines
+    from audio2lrc.models import LyricLine
+
+    lines = [LyricLine(12.34, "same text"), LyricLine(25.0, "hello")]
+    monkeypatch.setattr(
+        "audio2lrc.cli.translate_batched",
+        lambda *a, **k: (["same text", "hola"], "ja"),
+    )
+    out, detected, note, romanized = _build_output_lines(
+        lines, translate=True, romanize=False,
+        source_lang=None, target_lang="es",
+    )
+    assert [l.text for l in out] == ["same text", "hello", "hola"]
+    assert detected == "ja"
+    assert not romanized
 
 
 def test_romanize_passthrough_non_cjk():

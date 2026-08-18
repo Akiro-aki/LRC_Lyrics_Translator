@@ -35,7 +35,8 @@ def translate_batched(
 
     Batch translates first; if the returned count mismatches the input count,
     retries per-line. Line positions never shift: skipped lines keep their
-    original text.
+    original text. Raises TranslationError when nothing at all could be
+    translated (so callers never mistake originals for translations).
     """
     skip_indices = skip_indices or set()
     result: list[str] = [lines[i] for i in range(len(lines))]
@@ -44,22 +45,30 @@ def translate_batched(
         return result, None
     to_translate = [lines[i] for i in ids]
 
+    last_error: TranslationError | None = None
     try:
         translated, detected = translator.translate(to_translate, source_lang, target_lang)
         if len(translated) == len(ids):
             for i, text in zip(ids, translated):
                 result[i] = text
-            return result, detected
-    except TranslationError:
-        pass
+            if detected or any(result[i] != lines[i] for i in ids):
+                return result, detected
+    except TranslationError as exc:
+        last_error = exc
 
-    detected: str | None = None
+    detected = None
+    changed = False
     for i, text in zip(ids, to_translate):
         try:
             single, det = translator.translate([text], source_lang, target_lang)
             detected = detected or det
             if len(single) == 1 and single[0].strip():
                 result[i] = single[0]
-        except TranslationError:
-            pass  # keep the original line; never shift timestamps
+                changed = changed or single[0] != text
+        except TranslationError as exc:
+            last_error = last_error or exc
+    if not changed and not detected:
+        raise last_error or TranslationError(
+            "translation failed: backend returned no usable translations"
+        )
     return result, detected
