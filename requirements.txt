@@ -1,0 +1,5 @@
+mutagen>=1.47
+requests>=2.31
+langdetect>=1.0.9
+pykakasi>=2.2
+pypinyin>=0.49
