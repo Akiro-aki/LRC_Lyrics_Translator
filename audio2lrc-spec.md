@@ -30,7 +30,7 @@ audio2lrc song.mp3 --out ./lyrics/song.lrc
 - `--target-lang`: required if `--translate` is set.
 - `--source-lang`: optional; auto-detect if omitted.
 - `--romanize`: optional, same as prior specs — adds a transliterated line for non-Latin scripts.
-- `--out`: optional output path; default to `{audio-filename}.lrc` (or `.{target-lang}.lrc` if translated), next to the source file.
+- `--out`: optional output path; default to `{audio-filename}.lrc`, next to the source file.
 - `--prefer-embedded` / `--prefer-lrclib`: optional flag to control which source wins if **both** embedded lyrics and an LRCLIB match are available (default: prefer embedded if it's synced, otherwise prefer LRCLIB if it has synced lyrics and embedded doesn't).
 
 ---

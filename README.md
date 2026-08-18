@@ -1,6 +1,6 @@
 # audio2lrc
 
-Audio file → synced lyrics → translated `.lrc` subtitle file.
+**Audio file → synced lyrics → translated `.lrc` subtitle file.**
 
 Point it at a local audio file (`.mp3`, `.flac`, `.m4a`, `.ogg`, ...). It reads
 the file's own metadata tags (title/artist/album/duration), finds synced lyrics
@@ -9,12 +9,61 @@ translates them, and writes a `.lrc` file next to the source.
 
 No manual song-name entry — everything comes from the file itself.
 
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![CI](https://github.com/akiro/audio2lrc/actions/workflows/ci.yml/badge.svg)](https://github.com/akiro/audio2lrc/actions/workflows/ci.yml)
+
 ---
 
-## Quick start
+## What it does
 
-Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/) (fast, handles the
-virtualenv + dependencies automatically).
+```text
+$ ./run.sh YOASOBI_Yoru_ni_Kakeru.flac --translate --target-lang en --romanize
+[audio2lrc] metadata: YOASOBI - 夜に駆ける (4:21)
+[audio2lrc] source: lrclib.net (synced, 73 lines)
+[audio2lrc] wrote YOASOBI_Yoru_ni_Kakeru.lrc
+```
+
+The resulting `.lrc` (works in any player that supports synced lyrics):
+
+```text
+[ti:夜に駆ける]
+[ar:YOASOBI]
+[al:THE BOOK]
+#X-SOURCE: lrclib.net
+#X-TRANSLATED-FROM: ja
+#X-TARGET-LANG: en
+[00:12.34]沈むように溶けてゆくように
+[00:12.34]Shizumu youni tokete yuku youni
+[00:12.34]As if sinking, as if melting away
+```
+
+## Features
+
+- **Zero configuration** — lyrics come from the file itself, no typing song names
+- **Offline when possible** — uses lyrics already embedded in the file's tags
+- **Free synced lyrics** — falls back to LRCLIB (no API key required), with on-disk caching
+- **Translation** — Google (free, no key), LibreTranslate, or any OpenAI-compatible API
+- **Romanization** — romaji for Japanese, pinyin for Chinese
+- **Batch mode** — process a whole music library in one command (`--recursive`)
+- **Wide format support** — mp3, flac, m4a/mp4, ogg/opus, wav, aiff, aac, wv, ape, mpc, spx
+
+## Install
+
+Requires **Python 3.10+**. Any of these work:
+
+```bash
+# Option A: with uv (fastest, recommended)
+uv sync && uv run audio2lrc --version
+
+# Option B: plain pip
+pip install -e .
+
+# Option C: no install at all — the wrapper script handles everything
+./run.sh --version        # creates .venv and installs deps on first run
+```
+
+## Quick start
 
 ```bash
 ./run.sh song.mp3                          # extract/fetch synced lyrics only
@@ -23,16 +72,7 @@ virtualenv + dependencies automatically).
 ./run.sh song.mp3 --out ./lyrics/song.lrc  # custom output path
 ```
 
-First run creates `.venv/` and installs dependencies; afterwards it starts
-instantly. You can also install the package globally and use the `audio2lrc`
-command directly:
-
-```bash
-uv sync                                   # create .venv
-uv run audio2lrc song.mp3
-```
-
----
+If you installed the package, replace `./run.sh` with `audio2lrc`.
 
 ## Do I need an API?
 
@@ -60,9 +100,6 @@ audio2lrc AUDIO [--translate] [--target-lang LANG] [--source-lang LANG]
 Path to an audio file (mp3, flac, m4a/mp4, ogg/opus, wav, ...) **or a
 directory**. When it's a directory, every audio file in it is processed in
 batch mode (see below).
-
-### `--recursive` / `-r`
-With a directory, also scan subdirectories.
 
 ### `--translate`
 Enables translation. Without it, the app only extracts/fetches the original
@@ -93,12 +130,8 @@ the app. Japanese romanization downloads pykakasi's dictionary once on first
 use (needs network that one time).
 
 ### `--out PATH`
-Custom output path. Default: `{audio-filename}.lrc` next to the source, or
-`{audio-filename}.{target-lang}.lrc` when translated. Cannot be used in batch
-mode.
-
-### `--recursive` / `-r`
-When the positional arg is a directory, also scan its subdirectories.
+Custom output path. Default: `{audio-filename}.lrc` next to the source.
+Cannot be used in batch mode.
 
 ### `--prefer-embedded` / `--prefer-lrclib`
 Controls which source wins when both embedded lyrics and an LRCLIB match
@@ -141,50 +174,6 @@ Behavior:
 
 ---
 
-## What it does, step by step
-
-1. **Reads tags** — title, artist, album, duration; embedded lyrics:
-   - **ID3 (mp3):** `SYLT` (synced) preferred over `USLT` (plain)
-   - **Vorbis (flac/ogg/opus):** `LYRICS` / `UNSYNCEDLYRICS` — treated as
-     unsynced unless they contain LRC timestamps
-   - **MP4/M4A:** `©lyr` atom — same rule (some taggers embed full `.lrc`
-     text there, which is detected and used as synced)
-   - If title/artist tags are missing, falls back to parsing the filename
-     (`Artist - Title.mp3`) and logs that it's a low-confidence guess.
-2. **Resolves lyrics** using the priority above.
-3. **Translates** (only with `--translate`): batches all lines in one call;
-   if the response line count mismatches, retries per-line. Section markers
-   (`[Chorus]`, `[Instrumental]`, ...) and empty lines pass through unchanged.
-   Timestamps are never shifted.
-4. **Writes the `.lrc`:**
-
-   Without translation:
-   ```
-   [ti:Song Title]
-   [ar:Artist Name]
-   [al:Album]
-   #X-SOURCE: embedded | lrclib.net
-   [00:12.34]Lyric line
-   ```
-
-   With translation (stacked at the same timestamp):
-   ```
-   [ti:Song Title]
-   [ar:Artist Name]
-   [al:Album]
-   #X-SOURCE: lrclib.net
-   #X-TRANSLATED-FROM: ja
-   #X-TARGET-LANG: en
-   [00:12.34]元の歌詞の行
-   [00:12.34]Moto no kashi no gyou
-   [00:12.34]Original lyric line translated to English
-   ```
-
-   Unsynced lyrics are still written as a valid `.lrc`: every line gets a
-   `[00:00.00]` timestamp and the file gets `#X-UNSYNCED: true`.
-
----
-
 ## Configuration (translation backends)
 
 Copy `.env.example` to `.env` (auto-loaded from the working directory or your
@@ -218,25 +207,47 @@ CACHE_DIR=~/.cache/audio2lrc    # override the lyrics cache location
 
 ---
 
-## Examples
+## How it works
 
-```bash
-# Just synced lyrics for a tagged mp3, using embedded tags if present
-./run.sh ~/Music/Rick_Astley_Never_Gonna_Give_You_Up.mp3
+1. **Reads tags** — title, artist, album, duration; embedded lyrics:
+   - **ID3 (mp3):** `SYLT` (synced) preferred over `USLT` (plain)
+   - **Vorbis (flac/ogg/opus):** `LYRICS` / `UNSYNCEDLYRICS` — treated as
+     unsynced unless they contain LRC timestamps
+   - **MP4/M4A:** `©lyr` atom — same rule (some taggers embed full `.lrc`
+     text there, which is detected and used as synced)
+   - If title/artist tags are missing, falls back to parsing the filename
+     (`Artist - Title.mp3`) and logs that it's a low-confidence guess.
+2. **Resolves lyrics** using the priority above.
+3. **Translates** (only with `--translate`): batches all lines in one call;
+   if the response line count mismatches, retries per-line. Section markers
+   (`[Chorus]`, `[Instrumental]`, ...) and empty lines pass through unchanged.
+   Timestamps are never shifted.
+4. **Writes the `.lrc`:**
 
-# Translate a Japanese track to English with romaji added
-./run.sh ~/Music/YOASOBI_Yoru_ni_Kakeru.flac --translate --target-lang en --romanize
+   Without translation:
+   ```
+   [ti:Song Title]
+   [ar:Artist Name]
+   [al:Album]
+   #X-SOURCE: embedded | lrclib.net
+   [00:12.34]Lyric line
+   ```
 
-# Process a whole album folder, one .lrc next to each song
-./run.sh ~/Music/Album
-./run.sh ~/Music/Music_Library --recursive --translate --target-lang en
+   Unsynced lyrics are still written as a valid `.lrc`: every line gets a
+   `[00:00.00]` timestamp and the file gets `#X-UNSYNCED: true`.
 
-# Prefer the file's own lyrics even if unsynced
-./run.sh song.mp3 --prefer-embedded
+---
 
-# Output somewhere else
-./run.sh song.mp3 --translate --target-lang es --out ./lyrics/song.es.lrc
-```
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `error: no lyrics found` | The file is untagged or has no embedded lyrics and LRCLIB has no match. `--prefer-embedded` can help for files with embedded lyrics. |
+| `low confidence: guessed artist/title from filename` | File has no ID3/Vorbis tags; rename it `Artist - Title.ext` for the best guess. |
+| Translation fails / no output | Check the backend config in `.env` (see above). `TRANSLATOR_BACKEND=google` works without any key. |
+| `--target-lang` errors | `--translate` requires `--target-lang`, e.g. `--target-lang en`. |
+| `--out` rejected | `--out` only works for single files, not in batch (directory) mode. |
+| Works on files, not on my NAS/SMB share | Mount the share first (e.g. `sudo mount -t cifs //server/share /mnt/music -o username=USER,uid=$(id -u),gid=$(id -g)`) and point audio2lrc at the mount path. The app needs write access to write `.lrc` files next to the audio. |
 
 ## Exit codes
 
@@ -244,17 +255,22 @@ CACHE_DIR=~/.cache/audio2lrc    # override the lyrics cache location
 - `1` — any error (unsupported file, no lyrics found anywhere, translation
   backend misconfigured, network failure, ...) — with a clear message on stderr
 
-## Tests
+---
+
+## Contributing
 
 ```bash
-uv run pytest
+git clone https://github.com/akiro/audio2lrc.git
+cd audio2lrc
+uv sync --extra dev
+uv run pytest          # 53 tests
 ```
 
-Covers tag extraction (mp3/flac/m4a), LRC parsing/writing, resolution
-priority rules, LRCLIB caching, batch-translation fallback and the CLI.
+- Tests live in `tests/` and cover tag extraction (mp3/flac/m4a), LRC
+  parsing/writing, resolution priority rules, LRCLIB caching,
+  batch-translation fallback and the CLI.
+- The detailed design notes are in [audio2lrc-spec.md](audio2lrc-spec.md).
 
-## Non-goals (v1)
+## License
 
-- No audio fingerprinting for untagged files (filename fallback is it)
-- No bundled translation API keys
-- The source audio file's tags are never modified — output is a separate `.lrc`
+[MIT](LICENSE)

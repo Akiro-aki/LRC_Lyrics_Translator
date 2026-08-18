@@ -81,12 +81,10 @@ def _build_translator() -> GoogleTranslator | LibreTranslateTranslator | OpenAIT
     return GoogleTranslator()
 
 
-def _output_path(audio: str, target_lang: str | None, out: str | None) -> str:
+def _output_path(audio: str, out: str | None) -> str:
     if out:
         return out
     stem, _ = os.path.splitext(audio)
-    if target_lang:
-        return f"{stem}.{target_lang}.lrc"
     return f"{stem}.lrc"
 
 
@@ -239,7 +237,7 @@ def _process_file(audio: str, args: argparse.Namespace, cache_dir: str | None) -
         note=note,
     )
 
-    out_path = _output_path(audio, target_lang, args.out)
+    out_path = _output_path(audio, args.out)
     try:
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(text)

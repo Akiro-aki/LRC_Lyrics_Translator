@@ -56,7 +56,7 @@ def test_cli_output_name_for_translated(mp3_path):
         pass  # offline environment: skip network-dependent assertions
     else:
         assert proc.returncode == 0, proc.stderr
-        out = mp3_path.with_name("track.en.lrc")
+        out = mp3_path.with_name("track.lrc")
         assert out.exists()
 
 
