@@ -42,6 +42,19 @@ class TrackMetadata:
             params["duration"] = int(self.duration)
         return params
 
+    def netease_query(self) -> str:
+        """Search keywords for a NetEase / QQ Music lookup."""
+        return self.search_query()
+
+    def search_query(self) -> str:
+        """Free-text search keywords: title then artist."""
+        parts: list[str] = []
+        if self.title:
+            parts.append(self.title)
+        if self.artist:
+            parts.append(self.artist)
+        return " ".join(parts)
+
 
 @dataclass
 class EmbeddedLyrics:
@@ -56,9 +69,29 @@ class EmbeddedLyrics:
 class ResolvedLyrics:
     """Final lyrics resolution result."""
 
-    source: str  # "embedded" | "lrclib.net"
+    source: str  # "embedded" | "lrclib.net" | "music.163.com" | "y.qq.com"
     lines: list[LyricLine] = field(default_factory=list)
     unsynced: bool = False
+    confidence: float | None = None  # match confidence 0..1 (external sources)
+    matched: str | None = None  # human-readable description of the matched record
+    notes: list[str] = field(default_factory=list)  # why external sources were not used
+
+
+@dataclass
+class ProviderResult:
+    """What a lyrics provider found for one track.
+
+    confidence is the match confidence (0..1) of the record the lyrics came
+    from; rejected explains why the closest candidate was turned down when
+    nothing usable matched.
+    """
+
+    synced: list[LyricLine] | None = None
+    plain: list[LyricLine] | None = None
+    instrumental: bool = False
+    confidence: float | None = None
+    matched: str | None = None
+    rejected: str | None = None
 
 
 class LyricsNotFoundError(Exception):

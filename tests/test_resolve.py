@@ -98,7 +98,7 @@ def test_prefer_lrclib_overrides_embedded_synced(fake_lrclib):
     result = resolve(
         META,
         EmbeddedLyrics(text=SYNCED, synced=True),
-        prefer_lrclib=True,
+        prefer_external=True,
         cache_dir=cache_dir,
     )
     assert result.source == "lrclib.net"
@@ -129,3 +129,151 @@ def test_embedded_with_timestamps_in_plain_field_is_synced():
     )
     assert result.source == "embedded"
     assert not result.unsynced
+
+
+@pytest.fixture
+def fake_netease(monkeypatch, tmp_path):
+    """Stub the NetEase HTTP layer."""
+    hits = []
+    cache_dir = tmp_path / "cache"
+
+    def install(search_results=None, lyrics_map=None):
+        search_resp = {"result": {"songs": search_results or []}}
+        lyrics_map = lyrics_map or {}
+
+        def fake_get(url, params=None, **kwargs):
+            hits.append(url)
+            if "search" in url:
+                return search_resp
+            if "lyric" in url:
+                return lyrics_map.get(int(params["id"]), {})
+            return {}
+
+        monkeypatch.setattr("audio2lrc.providers.netease._get", fake_get)
+        return hits, str(cache_dir)
+
+    return install
+
+
+def test_provider_auto_prefers_lrclib_when_match(fake_lrclib, fake_netease, tmp_path):
+    """auto tries lrclib first; if it has synced lyrics, netease is never hit."""
+    lrclib_hits, lrclib_cache = fake_lrclib(synced=SYNCED)
+    netease_hits, _ = fake_netease()
+    result = resolve(META, None, provider="auto", cache_dir=lrclib_cache)
+    assert result.source == "lrclib.net"
+    assert not result.unsynced
+    assert len(lrclib_hits) == 1
+
+
+def test_provider_auto_falls_back_to_netease(fake_lrclib, fake_netease, tmp_path):
+    """When lrclib has nothing, auto falls back to netease."""
+    lrclib_hits, lrclib_cache = fake_lrclib()  # no results
+    netease_hits, _ = fake_netease(
+        search_results=[{"id": 7, "name": "Song", "artists": [{"name": "Artist"}], "album": {}, "duration": 120000}],
+        lyrics_map={7: {"lrc": {"lyric": SYNCED}}},
+    )
+    result = resolve(META, None, provider="auto", cache_dir=lrclib_cache)
+    assert result.source == "music.163.com"
+    assert not result.unsynced
+    assert len(lrclib_hits) == 1  # lrclib was attempted
+
+
+def test_provider_netease_only(fake_netease, tmp_path):
+    netease_hits, _ = fake_netease(
+        search_results=[{"id": 7, "name": "Song", "artists": [{"name": "Artist"}], "album": {}, "duration": 120000}],
+        lyrics_map={7: {"lrc": {"lyric": SYNCED}}},
+    )
+    result = resolve(META, None, provider="netease", cache_dir=str(tmp_path / "c"))
+    assert result.source == "music.163.com"
+    assert not result.unsynced
+
+
+def test_unknown_provider_errors():
+    with pytest.raises(LyricsNotFoundError, match="unknown lyrics provider"):
+        resolve(META, None, provider="bogus", cache_dir="/tmp/x")
+
+# -- best-match selection across providers --------------------------------------
+
+NETEASE_SONG = {"id": 7, "name": "Song", "artists": [{"name": "Artist"}], "album": {}, "duration": 120000}
+
+
+@pytest.fixture
+def fake_qqmusic(monkeypatch):
+    hits = []
+
+    def install(songs=None, lyrics=None):
+        def fake_post(url, payload):
+            hits.append(url)
+            return {"req_1": {"data": {"body": {"song": {"list": songs or []}}}}}
+
+        def fake_get(url, params=None):
+            hits.append(url)
+            if "lyric" in url:
+                return (lyrics or {}).get(params["songmid"], {})
+            return {}
+
+        monkeypatch.setattr("audio2lrc.providers.qqmusic._post", fake_post)
+        monkeypatch.setattr("audio2lrc.providers.qqmusic._get", fake_get)
+        return hits
+
+    return install
+
+
+def test_auto_prefers_synced_netease_over_plain_lrclib(fake_lrclib, fake_netease, fake_qqmusic):
+    _, cache_dir = fake_lrclib(plain=PLAIN)
+    fake_netease(search_results=[NETEASE_SONG], lyrics_map={7: {"lrc": {"lyric": SYNCED}}})
+    fake_qqmusic()
+    result = resolve(META, None, provider="auto", cache_dir=cache_dir)
+    assert result.source == "music.163.com"
+    assert not result.unsynced
+    assert result.confidence > 0.9
+    assert result.matched
+
+
+def test_auto_stops_after_strong_synced_match(fake_lrclib, fake_netease, fake_qqmusic):
+    _, cache_dir = fake_lrclib(synced=SYNCED)
+    netease_hits, _ = fake_netease()
+    qq_hits = fake_qqmusic()
+    result = resolve(META, None, provider="auto", cache_dir=cache_dir)
+    assert result.source == "lrclib.net"
+    assert netease_hits == [] and qq_hits == []
+
+
+def test_auto_reaches_qqmusic(fake_lrclib, fake_netease, fake_qqmusic):
+    _, cache_dir = fake_lrclib()
+    fake_netease()
+    fake_qqmusic(
+        songs=[{"mid": "q", "name": "Song", "singer": [{"name": "Artist"}], "interval": 120}],
+        lyrics={"q": {"lyric": SYNCED}},
+    )
+    result = resolve(META, None, provider="auto", cache_dir=cache_dir)
+    assert result.source == "y.qq.com"
+
+
+def test_error_explains_rejected_candidates(fake_netease, tmp_path):
+    fake_netease(
+        search_results=[{**NETEASE_SONG, "name": "Song (Live)"}],
+        lyrics_map={7: {"lrc": {"lyric": SYNCED}}},
+    )
+    with pytest.raises(LyricsNotFoundError, match=r"version mismatch \(live\)"):
+        resolve(META, None, provider="netease", cache_dir=str(tmp_path / "c"))
+
+
+def test_min_confidence_rejects_weak_match(fake_netease, tmp_path):
+    meta = TrackMetadata(title="Song")  # title-only match is capped at 0.7
+    fake_netease(search_results=[NETEASE_SONG], lyrics_map={7: {"lrc": {"lyric": SYNCED}}})
+    cache = str(tmp_path / "c")
+    assert resolve(meta, None, provider="netease", cache_dir=cache).source == "music.163.com"
+    with pytest.raises(LyricsNotFoundError, match="low confidence"):
+        resolve(meta, None, provider="netease", cache_dir=cache, min_confidence=0.8)
+
+
+def test_embedded_fallback_explains_rejection(fake_netease, tmp_path):
+    fake_netease(
+        search_results=[{**NETEASE_SONG, "name": "Song (Remix)"}],
+        lyrics_map={7: {"lrc": {"lyric": SYNCED}}},
+    )
+    result = resolve(META, EmbeddedLyrics(text=PLAIN, synced=False),
+                     provider="netease", cache_dir=str(tmp_path / "c"))
+    assert result.source == "embedded"
+    assert any("version mismatch (remix)" in n for n in result.notes)

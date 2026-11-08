@@ -16,8 +16,9 @@ from audio2lrc.models import (
     TrackMetadata,
     TranslationError,
 )
-from audio2lrc.resolve import resolve
+from audio2lrc.resolve import PROVIDER_CHOICES, resolve, resolve_from_url
 from audio2lrc.translate import (
+    GeminiTranslator,
     GoogleTranslator,
     LibreTranslateTranslator,
     OpenAITranslator,
@@ -47,19 +48,48 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Extract/fetch synced lyrics for an audio file (or every audio "
         "file in a directory) and optionally translate them into .lrc files.",
     )
-    p.add_argument("audio", help="path to an audio file (mp3, flac, m4a, ogg, ...) or a directory")
+    p.add_argument("audio", nargs="?", help="path to an audio file (mp3, flac, m4a, ogg, ...) or a directory")
+    p.add_argument("--lrclib-link", metavar="URL",
+                   help="fetch lyrics directly from an LRCLIB song link "
+                        "(e.g. https://lrclib.net/song/<id>) instead of from an audio file")
     p.add_argument("--translate", action="store_true", help="translate the lyrics")
     p.add_argument("--target-lang", metavar="LANG", help="target language code (required with --translate)")
     p.add_argument("--source-lang", metavar="LANG", help="source language code (auto-detected if omitted)")
     p.add_argument("--romanize", action="store_true", help="add a romanized line for non-Latin scripts")
+    p.add_argument("--translator", choices=["google", "libretranslate", "openai", "gemini"],
+                   help="translation backend (default: TRANSLATOR_BACKEND env or google)")
+    p.add_argument("--api-key", metavar="KEY",
+                   help="API key for the chosen backend (overrides the env variable)")
     p.add_argument("--out", metavar="PATH", help="output .lrc path (default: next to the audio file)")
     p.add_argument("--recursive", "-r", action="store_true",
                    help="scan subdirectories when the positional arg is a directory")
+    p.add_argument("--provider", choices=list(PROVIDER_CHOICES),
+                   help="lyrics source (default: LYRICS_PROVIDER env or lrclib); "
+                        "auto asks every provider and keeps the best verified match")
+    p.add_argument("--min-confidence", type=_confidence, metavar="0-1",
+                   help="reject external matches below this confidence "
+                        "(default: LYRICS_MIN_CONFIDENCE env or 0.6)")
     group = p.add_mutually_exclusive_group()
     group.add_argument("--prefer-embedded", action="store_true", help="prefer the file's embedded lyrics")
-    group.add_argument("--prefer-lrclib", action="store_true", help="prefer an LRCLIB match")
+    group.add_argument("--prefer-external", action="store_true",
+                       help="prefer external lyrics over embedded")
+    group.add_argument("--prefer-lrclib", action="store_true",
+                       help="alias for --prefer-external (backward compat)")
     p.add_argument("--version", action="version", version=f"audio2lrc {__version__}")
     return p
+
+
+LOW_CONFIDENCE_WARNING = 0.75
+
+
+def _confidence(value: str) -> float:
+    try:
+        f = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {value!r}") from None
+    if not 0.0 <= f <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return f
 
 
 def _log(message: str) -> None:
@@ -72,12 +102,16 @@ def _normalize_lang(lang: str | None) -> str | None:
     return lang.strip().lower().split("-")[0].split("_")[0]
 
 
-def _build_translator() -> GoogleTranslator | LibreTranslateTranslator | OpenAITranslator:
-    backend = os.environ.get("TRANSLATOR_BACKEND", "google").strip().lower()
+def _build_translator(
+    backend: str | None = None, api_key: str | None = None
+) -> GoogleTranslator | LibreTranslateTranslator | OpenAITranslator | GeminiTranslator:
+    backend = (backend or os.environ.get("TRANSLATOR_BACKEND", "google")).strip().lower()
     if backend == "libretranslate":
-        return LibreTranslateTranslator()
+        return LibreTranslateTranslator(api_key=api_key)
     if backend == "openai":
-        return OpenAITranslator()
+        return OpenAITranslator(api_key=api_key)
+    if backend == "gemini":
+        return GeminiTranslator(api_key=api_key)
     return GoogleTranslator()
 
 
@@ -124,6 +158,8 @@ def _build_output_lines(
     romanize: bool,
     source_lang: str | None,
     target_lang: str | None,
+    translator_backend: str | None = None,
+    api_key: str | None = None,
 ) -> tuple[list[LyricLine], str | None, str | None, bool]:
     """Apply translation/romanization, returning (lines, detected, note, romanized)."""
     if not translate:
@@ -139,7 +175,7 @@ def _build_output_lines(
         return lines, None, None, False
 
     skip = _skip_indices(lines)
-    translator = _build_translator()
+    translator = _build_translator(translator_backend, api_key)
     texts = [l.text for l in lines]
     translated, detected = translate_batched(translator, texts, source_lang, target_lang)
     detected = _normalize_lang(detected)
@@ -189,13 +225,18 @@ def _process_file(audio: str, args: argparse.Namespace, cache_dir: str | None) -
         kind = "synced" if embedded.synced else "unsynced"
         _log(f"embedded lyrics found ({kind}, from {embedded.note})")
 
+    provider = (args.provider or os.environ.get("LYRICS_PROVIDER", "lrclib")).strip().lower()
+    prefer_external = args.prefer_external or args.prefer_lrclib
+
     try:
         resolved = resolve(
             meta,
             embedded,
             prefer_embedded=args.prefer_embedded,
-            prefer_lrclib=args.prefer_lrclib,
+            prefer_external=prefer_external,
+            provider=provider,
             cache_dir=cache_dir,
+            min_confidence=getattr(args, "min_confidence", None),
         )
     except LyricsNotFoundError as exc:
         sys.stderr.write(f"error: {audio}: {exc}\n")
@@ -205,6 +246,16 @@ def _process_file(audio: str, args: argparse.Namespace, cache_dir: str | None) -
         f"source: {resolved.source} ({'synced' if not resolved.unsynced else 'unsynced'}, "
         f"{len(resolved.lines)} lines)"
     )
+    for note in resolved.notes:
+        _log(f"note: {note}")
+    if resolved.matched:
+        confidence = resolved.confidence or 0.0
+        _log(f"matched: {resolved.matched}, confidence {confidence:.2f}")
+        if confidence < LOW_CONFIDENCE_WARNING:
+            _log(
+                "warning: low-confidence match; check the lyrics, or raise "
+                "--min-confidence to reject matches like this"
+            )
 
     translated_from: str | None = None
     target_lang: str | None = None
@@ -220,6 +271,8 @@ def _process_file(audio: str, args: argparse.Namespace, cache_dir: str | None) -
                 romanize=args.romanize,
                 source_lang=args.source_lang,
                 target_lang=args.target_lang,
+                translator_backend=args.translator,
+                api_key=args.api_key,
             )
         except TranslationError as exc:
             sys.stderr.write(f"error: {audio}: {exc}\n")
@@ -253,6 +306,78 @@ def _process_file(audio: str, args: argparse.Namespace, cache_dir: str | None) -
     return True
 
 
+def _process_link(url: str, args: argparse.Namespace) -> bool:
+    try:
+        resolved, meta = resolve_from_url(url)
+    except LyricsNotFoundError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return False
+
+    _log(
+        f"source: {resolved.source} ({'synced' if not resolved.unsynced else 'unsynced'}, "
+        f"{len(resolved.lines)} lines)"
+    )
+    for note in resolved.notes:
+        _log(f"note: {note}")
+    if resolved.matched:
+        confidence = resolved.confidence or 0.0
+        _log(f"matched: {resolved.matched}, confidence {confidence:.2f}")
+        if confidence < LOW_CONFIDENCE_WARNING:
+            _log(
+                "warning: low-confidence match; check the lyrics, or raise "
+                "--min-confidence to reject matches like this"
+            )
+
+    translated_from: str | None = None
+    target_lang: str | None = None
+    romanized = False
+    note: str | None = None
+
+    lines = resolved.lines
+    if args.translate or args.romanize:
+        try:
+            lines, detected, note, romanized = _build_output_lines(
+                resolved.lines,
+                translate=args.translate,
+                romanize=args.romanize,
+                source_lang=args.source_lang,
+                target_lang=args.target_lang,
+                translator_backend=args.translator,
+                api_key=args.api_key,
+            )
+        except TranslationError as exc:
+            sys.stderr.write(f"error: {exc}\n")
+            return False
+        if args.translate:
+            translated_from = detected or args.source_lang or "unknown"
+            target_lang = _normalize_lang(args.target_lang)
+            if note:
+                _log(f"note: {note}")
+
+    text = render_lrc(
+        meta,
+        lines,
+        source=resolved.source,
+        unsynced=resolved.unsynced,
+        translated_from=translated_from,
+        target_lang=target_lang,
+        romanized=romanized,
+        note=note,
+    )
+
+    title = (meta.title or "lyrics").strip().replace("/", "_")
+    out_path = args.out or f"{title}.lrc"
+    try:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError as exc:
+        sys.stderr.write(f"error: cannot write {out_path}: {exc}\n")
+        return False
+
+    _log(f"wrote {out_path}")
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     _load_dotenv()
     args = _build_parser().parse_args(argv)
@@ -262,6 +387,17 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     cache_dir = os.environ.get("CACHE_DIR") or None
+
+    if args.lrclib_link and args.audio:
+        sys.stderr.write("error: provide either an audio path or --lrclib-link, not both\n")
+        return 2
+
+    if args.lrclib_link:
+        return 0 if _process_link(args.lrclib_link, args) else 1
+
+    if not args.audio:
+        sys.stderr.write("error: an audio path or --lrclib-link is required\n")
+        return 2
 
     if os.path.isdir(args.audio):
         if args.out:
