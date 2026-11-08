@@ -30,7 +30,7 @@ class OpenAITranslator(Translator):
     ):
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY") or ""
         self.base_url = (base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
-        self.model = model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        self.model = model or os.environ.get("OPENAI_MODEL", "gemini-pro")
         if not self.api_key:
             raise TranslationError(
                 "OPENAI_API_KEY is not set; configure it in .env or pick a different TRANSLATOR_BACKEND"

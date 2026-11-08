@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
-import sys
 from typing import Any
 
 import requests
 
-from audio2lrc.models import LyricLine, LyricsNotFoundError, TrackMetadata
+from audio2lrc.models import LyricLine, LyricsNotFoundError, ProviderResult, TrackMetadata
+from audio2lrc.providers.cache import cache_path, cached_lookup, default_cache_dir
+from audio2lrc.providers.matching import (
+    Candidate,
+    default_min_confidence,
+    rank,
+    score_candidate,
+    select_lyrics,
+    to_result,
+)
 
 API_BASE = os.environ.get("LRCLIB_URL", "https://lrclib.net")
 _TIMEOUT = 20
-_MAX_DURATION_DIFF = 15.0
 
 
 def _request(url: str) -> Any:
@@ -25,13 +30,6 @@ def _request(url: str) -> Any:
     return resp.json()
 
 
-def _cache_path(cache_dir: str, meta: TrackMetadata) -> str:
-    key = hashlib.sha1(
-        f"{meta.title or ''}|{meta.artist or ''}|{meta.album or ''}|{meta.duration or ''}".encode("utf-8")
-    ).hexdigest()
-    return os.path.join(cache_dir, f"{key}.json")
-
-
 def _parse_lyrics(text: str | None) -> list[LyricLine] | None:
     if not text or not text.strip():
         return None
@@ -40,78 +38,90 @@ def _parse_lyrics(text: str | None) -> list[LyricLine] | None:
     return parse_lrc(text)
 
 
-def _pick_best(results: list[dict], duration: float | None) -> dict | None:
-    """Pick the best search result: prefer synced lyrics, then closest duration."""
-    if not results:
-        return None
+def _candidate(record: dict, meta: TrackMetadata | None = None) -> Candidate:
+    """Map an LRCLIB record to a Candidate.
 
-    def score(r: dict) -> tuple[int, float]:
-        synced = 0 if r.get("syncedLyrics") else 1
-        diff = abs((r.get("duration") or 0) - (duration or 0)) if duration else 0.0
-        return synced, diff
-
-    ranked = sorted(results, key=score)
-    best = ranked[0]
-    if duration and abs((best.get("duration") or 0) - duration) > _MAX_DURATION_DIFF:
-        return None
-    return best
-
-
-def fetch_lyrics(
-    meta: TrackMetadata,
-    cache_dir: str | None = None,
-) -> tuple[list[LyricLine] | None, list[LyricLine] | None, bool]:
-    """Fetch lyrics for a track from LRCLIB.
-
-    Returns (synced_lines, plain_lines, instrumental). plain_lines holds
-    unsynced lyrics when the server has no synced match. Results are cached
-    on disk keyed by title+artist+album+duration so re-runs never hit the
-    network again.
+    For /api/get hits the server already matched on our tags, so missing
+    fields fall back to the track's own metadata.
     """
-    params = meta.lrclib_query()
-    if not params or "track_name" not in params:
-        raise LyricsNotFoundError(
-            "cannot query LRCLIB: no title available (tags missing and filename not parseable)"
-        )
-
-    cache_dir = cache_dir or os.path.join(
-        os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "audio2lrc"
+    fallback = meta or TrackMetadata()
+    artist = record.get("artistName") or fallback.artist
+    return Candidate(
+        provider=LRCLIBProvider.name,
+        id=record.get("id"),
+        title=record.get("trackName") or record.get("name") or fallback.title or "",
+        artists=[artist] if artist else [],
+        album=record.get("albumName") or fallback.album,
+        duration=record.get("duration") or None,
+        raw=record,
     )
-    cache_file = _cache_path(cache_dir, meta)
 
-    data: dict | None = None
-    if os.path.exists(cache_file):
-        try:
-            with open(cache_file, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            data = None
 
-    if data is None:
+def _fetch_record(c: Candidate) -> tuple[str | None, str | None, bool]:
+    r = c.raw
+    return r.get("syncedLyrics"), r.get("plainLyrics"), bool(r.get("instrumental"))
+
+
+class LRCLIBProvider:
+    """Fetch lyrics from LRCLIB (lrclib.net)."""
+
+    name = "lrclib.net"
+
+    def fetch_lyrics(
+        self,
+        meta: TrackMetadata,
+        cache_dir: str | None = None,
+        min_confidence: float | None = None,
+    ) -> ProviderResult:
+        """Fetch lyrics for a track from LRCLIB.
+
+        Tries the exact-match /api/get endpoint first, then /api/search.
+        Every record goes through the shared matcher.  Results are cached on
+        disk keyed by title+artist+album+duration so re-runs never hit the
+        network again.
+        """
+        params = meta.lrclib_query()
+        if not params or "track_name" not in params:
+            raise LyricsNotFoundError(
+                "cannot query LRCLIB: no title available (tags missing and filename not parseable)"
+            )
+        min_conf = default_min_confidence() if min_confidence is None else min_confidence
+        path = cache_path(cache_dir or default_cache_dir(), "lrclib", meta)
         query = "&".join(f"{k}={requests.utils.quote(str(v))}" for k, v in params.items())
-        try:
+
+        def compute() -> dict:
             hit = _request(f"{API_BASE}/api/get?{query}")
-            if hit is None:
-                results = _request(f"{API_BASE}/api/search?{query}") or []
-                hit = _pick_best(results, meta.duration)
-        except requests.RequestException as exc:
+            if isinstance(hit, dict):
+                match = score_candidate(_candidate(hit, meta), meta)
+                if match.rejected is None and match.confidence >= min_conf:
+                    return select_lyrics([match], _fetch_record, meta)
+            results = _request(f"{API_BASE}/api/search?{query}")
+            if not isinstance(results, list):
+                results = []
+            matches, closest = rank([_candidate(r) for r in results], meta, min_conf)
+            return select_lyrics(matches, _fetch_record, meta, closest)
+
+        try:
+            data = cached_lookup(path, min_conf, compute, "LRCLIB")
+        except (requests.RequestException, OSError, ValueError) as exc:
             raise LyricsNotFoundError(
                 f"LRCLIB request failed ({exc}); "
                 "check your network connection or the LRCLIB_URL setting"
             ) from exc
-        data = hit or {"instrumental": False}
-        try:
-            os.makedirs(cache_dir, exist_ok=True)
-            tmp = cache_file + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, ensure_ascii=False)
-            os.replace(tmp, cache_file)
-        except OSError as exc:
-            sys.stderr.write(f"warning: could not write LRCLIB cache: {exc}\n")
+        return to_result(data, meta)
 
-    if data.get("instrumental"):
-        return None, None, True
+    def fetch_by_id(self, track_id: int) -> dict:
+        """Fetch a lyrics record directly by its LRCLIB track ID.
 
-    synced = _parse_lyrics(data.get("syncedLyrics"))
-    plain = _parse_lyrics(data.get("plainLyrics"))
-    return synced, plain, False
+        Returns the raw LRCLIB record dict (``trackName``, ``artistName``,
+        ``albumName``, ``syncedLyrics``, ``plainLyrics``, ``instrumental``, ...).
+        Raises LyricsNotFoundError when the ID does not exist or the request
+        fails.
+        """
+        data = _request(f"{API_BASE}/api/get/{track_id}")
+        if data is None:
+            raise LyricsNotFoundError(f"LRCLIB: no lyrics record for track id {track_id}")
+        return data
+
+
+lrclib = LRCLIBProvider()

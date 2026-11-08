@@ -1,5 +1,7 @@
 """Translation tests: batching, fallback, skipping, romanization."""
 
+import json
+
 import pytest
 
 from audio2lrc.models import TranslationError
@@ -144,6 +146,181 @@ def test_openai_requires_key(monkeypatch):
 
     with pytest.raises(TranslationError):
         OpenAITranslator(api_key="")
+
+
+def _gemini_ok(lines, detected="ja", total_tokens=50):
+    text = json.dumps({"lines": lines, "detected_source": detected})
+    return {
+        "candidates": [{"content": {"parts": [{"text": text}]}}],
+        "usageMetadata": {"totalTokenCount": total_tokens},
+    }
+
+
+class FakeGeminiResponse:
+    def __init__(self, status=200, payload=None, headers=None):
+        self.status_code = status
+        self._payload = payload or {}
+        self.headers = headers or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
+def test_gemini_requires_key(monkeypatch):
+    from audio2lrc.translate.gemini import GeminiTranslator
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    with pytest.raises(TranslationError):
+        GeminiTranslator(api_key="")
+
+
+def test_gemini_response_parsing(monkeypatch):
+    from audio2lrc.translate.gemini import GeminiTranslator
+
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append({"url": url, "headers": headers})
+        return FakeGeminiResponse(payload=_gemini_ok(["hola", "mundo"], detected="es"))
+
+    monkeypatch.setattr("audio2lrc.translate.gemini.requests.post", fake_post)
+    t = GeminiTranslator(api_key="k", tpm=100000)
+    result, detected = t.translate(["hi", "world"], None, "es")
+    assert result == ["hola", "mundo"]
+    assert detected == "es"
+    assert calls[0]["url"].endswith("/models/gemini-flash-lite-latest:generateContent")
+    assert calls[0]["headers"]["x-goog-api-key"] == "k"
+
+
+def test_gemini_parses_fenced_json(monkeypatch):
+    from audio2lrc.translate.gemini import GeminiTranslator
+
+    fenced = '```json\n{"lines": ["bonjour"], "detected_source": null}\n```'
+    payload = {"candidates": [{"content": {"parts": [{"text": fenced}]}}]}
+
+    monkeypatch.setattr(
+        "audio2lrc.translate.gemini.requests.post",
+        lambda *a, **k: FakeGeminiResponse(payload=payload),
+    )
+    result, detected = GeminiTranslator(api_key="k").translate(["hello"], None, "fr")
+    assert result == ["bonjour"]
+    assert detected is None
+
+
+def test_gemini_count_mismatch_raises(monkeypatch):
+    from audio2lrc.translate.gemini import GeminiTranslator
+
+    monkeypatch.setattr(
+        "audio2lrc.translate.gemini.requests.post",
+        lambda *a, **k: FakeGeminiResponse(payload=_gemini_ok(["only-one"])),
+    )
+    with pytest.raises(TranslationError):
+        GeminiTranslator(api_key="k").translate(["a", "b"], None, "es")
+
+
+def test_gemini_throttles_within_tpm(monkeypatch):
+    from audio2lrc.translate import gemini as gemini_mod
+
+    clock = {"now": 0.0}
+    sleeps: list[float] = []
+    monkeypatch.setattr(gemini_mod, "_monotonic", lambda: clock["now"])
+    monkeypatch.setattr(gemini_mod, "_sleep", lambda s: sleeps.append(s) or clock.__setitem__("now", clock["now"] + s))
+    monkeypatch.setattr(
+        gemini_mod.requests,
+        "post",
+        lambda *a, **k: FakeGeminiResponse(payload=_gemini_ok(["x"], total_tokens=80)),
+    )
+
+    t = gemini_mod.GeminiTranslator(api_key="k", tpm=150)
+    t.translate(["hello"], None, "es")
+    assert sleeps == []  # first call fits in the empty window
+    t.translate(["hello"], None, "es")
+    assert sleeps and sleeps[-1] > 0  # second call must wait for window room
+
+
+def test_gemini_throttles_within_rpm(monkeypatch):
+    from audio2lrc.translate import gemini as gemini_mod
+
+    clock = {"now": 0.0}
+    sleeps: list[float] = []
+    monkeypatch.setattr(gemini_mod, "_monotonic", lambda: clock["now"])
+    monkeypatch.setattr(gemini_mod, "_sleep", lambda s: sleeps.append(s) or clock.__setitem__("now", clock["now"] + s))
+    monkeypatch.setattr(
+        gemini_mod.requests,
+        "post",
+        lambda *a, **k: FakeGeminiResponse(payload=_gemini_ok(["x"])),
+    )
+
+    t = gemini_mod.GeminiTranslator(api_key="k", tpm=100000, rpm=2)
+    t.translate(["hello"], None, "es")
+    t.translate(["hello"], None, "es")
+    assert sleeps == []  # two requests fit inside rpm=2
+    t.translate(["hello"], None, "es")
+    assert sleeps and sleeps[-1] > 0  # third request must wait for RPM window room
+
+
+def test_gemini_404_fails_fast_with_hint(monkeypatch):
+    from audio2lrc.translate import gemini as gemini_mod
+
+    calls = []
+    monkeypatch.setattr(
+        gemini_mod.requests,
+        "post",
+        lambda *a, **k: (calls.append(1), FakeGeminiResponse(status=404))[1],
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(gemini_mod, "_sleep", lambda s: sleeps.append(s))
+
+    t = gemini_mod.GeminiTranslator(api_key="k")
+    with pytest.raises(TranslationError) as excinfo:
+        t.translate(["hi"], None, "es")
+    assert "GEMINI_MODEL" in str(excinfo.value)
+    assert len(calls) == 1 and sleeps == []
+
+
+def test_gemini_404_live_translate_hint(monkeypatch):
+    from audio2lrc.translate import gemini as gemini_mod
+
+    monkeypatch.setattr(
+        gemini_mod.requests,
+        "post",
+        lambda *a, **k: FakeGeminiResponse(status=404),
+    )
+    t = gemini_mod.GeminiTranslator(
+        api_key="k", model="gemini-3.5-live-translate-preview"
+    )
+    with pytest.raises(TranslationError) as excinfo:
+        t.translate(["hi"], None, "es")
+    assert "audio only" in str(excinfo.value)
+
+
+def test_gemini_retries_on_429(monkeypatch):
+    from audio2lrc.translate import gemini as gemini_mod
+
+    responses = [
+        FakeGeminiResponse(status=429, headers={"Retry-After": "0.01"}),
+        FakeGeminiResponse(payload=_gemini_ok(["hola"], detected="es")),
+    ]
+    seen = []
+
+    def fake_post(*a, **k):
+        seen.append(1)
+        return responses.pop(0)
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(gemini_mod, "_sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(gemini_mod.requests, "post", fake_post)
+
+    result, detected = gemini_mod.GeminiTranslator(api_key="k").translate(
+        ["hi"], None, "es"
+    )
+    assert result == ["hola"]
+    assert detected == "es"
+    assert len(seen) == 2 and len(sleeps) == 1
 
 
 def test_build_output_lines_skips_identical_translations(monkeypatch):
